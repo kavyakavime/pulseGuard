@@ -179,9 +179,7 @@ try:
                     else:
                         f = f / std
                         peaks, _ = scipy_signal.find_peaks(
-                            f,
-                            distance=int(0.45 * FS_PPG),  # ~45 BPM max
-                            height=0.5,
+                            f, distance=int(0.45 * FS_PPG), height=0.2,
                         )
                         peaks = peaks + (len(ir_arr) - N)  # Map back to full buffer
 
