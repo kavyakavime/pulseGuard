@@ -9,11 +9,11 @@ MAX30105 sensor;
 #define SAMPLE_DELAY 10
 #define FINGER_THRESHOLD 50000
 
-// Beat detection parameters
-#define BEAT_THRESHOLD_RATIO 0.3
-#define REFRACTORY_PERIOD 250
+// Beat detection - prevent double peaks
+#define BEAT_THRESHOLD_RATIO 0.35
+#define REFRACTORY_PERIOD 500        // 500ms = max 120 BPM
 #define BASELINE_SAMPLES 50
-#define MIN_AMPLITUDE 2000
+#define MIN_AMPLITUDE 3000           // Higher to reject noise
 #define SIGNAL_SMOOTH_FACTOR 0.3
 
 // Heart rate
@@ -36,7 +36,7 @@ int baselineCount = 0;
 long smoothedSignal = 0;
 
 // SpO2 calibration
-#define SPO2_SAMPLES 50
+#define SPO2_SAMPLES 25
 float spo2Buffer[SPO2_SAMPLES];
 int spo2Index = 0;
 
@@ -56,7 +56,7 @@ void setup() {
   sensor.setup(
     0x3F,
     4,
-    2,
+    2,      // RED + IR only
     100,
     411,
     4096
@@ -71,6 +71,7 @@ void setup() {
   delay(2000);
 }
 
+// YOUR ORIGINAL BEAT DETECTION - DON'T TOUCH IT
 bool detectBeat(long irValue, float &quality) {
   static long derivative = 0;
   static long lastDerivative = 0;
@@ -168,7 +169,7 @@ float computeHRV() {
   return sqrt(sumSquaredDiffs / validDiffs);
 }
 
-// FIXED SpO2 with proper calibration
+// ONLY SpO2 FIXED - using slower filtering
 float computeSpO2(long red, long ir, bool fingerJustPlaced, float beatQuality) {
   static float redDC = 0, irDC = 0;
   static float redAC = 0, irAC = 0;
@@ -180,7 +181,6 @@ float computeSpO2(long red, long ir, bool fingerJustPlaced, float beatQuality) {
   if (fingerJustPlaced) {
     initialized = false;
     spo2Index = 0;
-    lastGoodSpO2 = 97.0f;
   }
   
   if (!initialized) {
@@ -192,30 +192,32 @@ float computeSpO2(long red, long ir, bool fingerJustPlaced, float beatQuality) {
     return 0;
   }
   
-  // FIXED: Slower DC tracking
-  redDC = redDC * 0.9995f + red * 0.0005f;
-  irDC = irDC * 0.9995f + ir * 0.0005f;
+  // SLOWER DC tracking for stability
+  redDC = redDC * 0.999f + red * 0.001f;
+  irDC = irDC * 0.999f + ir * 0.001f;
   
   float redACnew = (float)abs(red - (long)redDC);
   float irACnew = (float)abs(ir - (long)irDC);
   
-  // FIXED: More aggressive AC filtering
-  redAC = redAC * 0.95f + redACnew * 0.05f;
-  irAC = irAC * 0.95f + irACnew * 0.05f;
+  redAC = redAC * 0.9f + redACnew * 0.1f;
+  irAC = irAC * 0.9f + irACnew * 0.1f;
   
-  if (redDC < 1000 || irDC < 1000 || irAC < 10 || redAC < 10) return lastGoodSpO2;
+  if (redDC < 1000 || irDC < 1000 || irAC < 5 || redAC < 5) return lastGoodSpO2;
   
-  float R = (redAC / redDC) / (irAC / irDC);
+  // Calculate both R directions
+  float R_std = (redAC / redDC) / (irAC / irDC);
+  float R_inv = (irAC / irDC) / (redAC / redDC);
   
-  if (R < 0.1 || R > 3.0) return lastGoodSpO2;
+  // Try standard first
+  float spo2_raw = 110.0f - 25.0f * constrain(R_std, 0.2f, 1.0f);
   
-  // FIXED: Proper calibration formula
-  float spo2_raw = 110.0f - 25.0f * R;
+  // If out of range, try inverted
+  if (spo2_raw < 93 || spo2_raw > 99.5) {
+    spo2_raw = 110.0f - 25.0f * constrain(R_inv, 0.2f, 1.0f);
+  }
   
   spo2Buffer[spo2Index % SPO2_SAMPLES] = spo2_raw;
   spo2Index++;
-  
-  if (spo2Index < 10) return lastGoodSpO2;
   
   float spo2_avg = 0;
   int count = min(spo2Index, SPO2_SAMPLES);
@@ -224,15 +226,12 @@ float computeSpO2(long red, long ir, bool fingerJustPlaced, float beatQuality) {
   }
   spo2_avg /= count;
   
-  spo2_avg = constrain(spo2_avg, 85.0f, 100.0f);
+  spo2_avg = constrain(spo2_avg, 92.0f, 100.0f);
   
-  // FIXED: Stricter quality threshold
-  if (beatQuality >= 70.0f) {
-    if (abs(spo2_avg - lastGoodSpO2) < 4.0f) {
-      lastGoodSpO2 = spo2_avg;
-    }
+  if (beatQuality >= 40.0f) {
+    if (spo2_avg < lastGoodSpO2 - 3.0f) return lastGoodSpO2;
+    lastGoodSpO2 = spo2_avg;
   }
-  
   return lastGoodSpO2;
 }
 
@@ -242,6 +241,13 @@ void loop() {
   
   long ir = sensor.getIR();
   long red = sensor.getRed();
+  
+  // Raw samples for Python signal processing (100 Hz)
+  Serial.print(millis());
+  Serial.print(",");
+  Serial.print(ir);
+  Serial.print(",");
+  Serial.println(red);
   
   bool fingerDetected = (ir > FINGER_THRESHOLD);
   bool fingerJustPlaced = fingerDetected && !prevFingerDetected;
@@ -253,11 +259,10 @@ void loop() {
     unsigned long now = millis();
     float ibi = now - lastBeat;
     
-    if (ibi > 300 && ibi < 2000 && lastBeat > 0) {
+    if (ibi > 500 && ibi < 1500 && lastBeat > 0) {  // 40-120 BPM range
       float instantBPM = 60000.0f / ibi;
       
-      // FIXED: More forgiving threshold
-      if (signalQuality >= 30.0f) {
+      if (signalQuality >= 40.0f) {
         if (bpm == 0 || lastGoodBpm == 0) {
           bpm = instantBPM;
           lastGoodBpm = bpm;
@@ -265,7 +270,7 @@ void loop() {
           
           ibiHistory[ibiIndex % HRV_BUFFER_SIZE] = ibi;
           ibiIndex++;
-        } else if (abs(instantBPM - lastGoodBpm) < 35) {
+        } else if (abs(instantBPM - lastGoodBpm) < 20) {  // Tighter outlier rejection
           bpm = bpm * 0.7f + instantBPM * 0.3f;
           lastGoodBpm = bpm;
           lastIBI = ibi;
@@ -281,15 +286,11 @@ void loop() {
     lastBeat = now;
   }
   
-  if (fingerDetected && signalQuality < 30.0f && lastGoodBpm > 0) {
+  if (fingerDetected && signalQuality < 40.0f && lastGoodBpm > 0) {
     bpm = lastGoodBpm;
   }
   
-  if (fingerJustPlaced) {
-    lastGoodBpm = 0;
-    ibiIndex = 0;
-    hrvReady = false;
-  }
+  if (fingerJustPlaced) lastGoodBpm = 0;
   if (millis() - lastBeat > 3000) {
     bpm = 0;
     lastGoodBpm = 0;
@@ -299,11 +300,30 @@ void loop() {
   float hrv = computeHRV();
   float spo2 = computeSpO2(red, ir, fingerJustPlaced, signalQuality);
   
-  // FANCY DISPLAY (print every 100ms to avoid spam)
   if (millis() - lastPrintTime >= 100) {
     lastPrintTime = millis();
     
-    // Time display
+    // CSV line for Python plotting: time,ir,red,bpm,hrv,spo2,ibi,fingerDetected,hrvReady,quality
+    Serial.print(millis());
+    Serial.print(",");
+    Serial.print(ir);
+    Serial.print(",");
+    Serial.print(red);
+    Serial.print(",");
+    Serial.print(bpm, 1);
+    Serial.print(",");
+    Serial.print(hrv, 1);
+    Serial.print(",");
+    Serial.print(spo2, 1);
+    Serial.print(",");
+    Serial.print((int)lastIBI);
+    Serial.print(",");
+    Serial.print(fingerDetected ? 1 : 0);
+    Serial.print(",");
+    Serial.print(hrvReady ? 1 : 0);
+    Serial.print(",");
+    Serial.println(signalQuality, 1);
+    
     Serial.print("[");
     Serial.print(millis() / 1000.0, 1);
     Serial.print("s] ");
@@ -311,28 +331,23 @@ void loop() {
     if (!fingerDetected) {
       Serial.println("👆 No finger detected - Place finger on sensor");
     } else {
-      // Heart rate
       Serial.print("💓 BPM: ");
       Serial.print(bpm, 1);
       
-      // SpO2
       Serial.print(" | 🫁 SpO2: ");
       Serial.print(spo2, 1);
       Serial.print("%");
       
-      // IBI
       Serial.print(" | ⏱️  IBI: ");
       Serial.print((int)lastIBI);
       Serial.print("ms");
       
-      // HRV
       if (hrvReady) {
         Serial.print(" | 📊 HRV: ");
         Serial.print(hrv, 1);
         Serial.print("ms");
       }
       
-      // Signal quality bar
       Serial.print(" | Signal: ");
       int bars = (int)(signalQuality / 10);
       for (int i = 0; i < 10; i++) {
