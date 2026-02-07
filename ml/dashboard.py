@@ -16,7 +16,7 @@ from model import GeneralStrainClassifier
 from ingest import DataIngestor
 
 st.set_page_config(
-    page_title="🫀 PulseGuard",
+    page_title="PulseGuard",
     layout="wide"
 )
 
@@ -30,8 +30,8 @@ def load_model():
         return None
 
 # Title
-st.markdown("# 🫀 PulseGuard")
-st.markdown("### Real-Time Community Health & Sustainability Platform")
+st.markdown("# PulseGuard — Guardian AI")
+st.markdown("### Real-Time Physiological Strain Detection")
 
 # Sidebar
 st.sidebar.header("⚙️ Settings")
@@ -66,20 +66,24 @@ else:
     ingestor = DataIngestor(mode='serial', serial_port=serial_port)
 
 # Main dashboard
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 
 with col1:
     hr_display = st.empty()
 with col2:
     hrv_display = st.empty()
 with col3:
+    strain_display = st.empty()
+with col4:
     risk_display = st.empty()
 
 quality_display = st.empty()
 hrv_ready_display = st.empty()
+recommendation_display = st.empty()
 
 # Plots
 waveform_plot = st.empty()
+gauge_plot = st.empty()
 status_indicator = st.empty()
 timeline_plot = st.empty()
 
@@ -144,19 +148,28 @@ if st.sidebar.button("▶️ Start Monitoring"):
 
         # Update displays
         if np.isnan(hr):
-            hr_display.metric("💓 Heart Rate", "—")
+            hr_display.metric("Heart Rate", "—")
         else:
-            hr_display.metric("💓 Heart Rate", f"{hr:.0f} BPM")
+            hr_display.metric("Heart Rate", f"{hr:.0f} BPM")
         if np.isnan(hrv):
-            hrv_display.metric("🧠 HRV", "warming up…")
+            hrv_display.metric("HRV", "warming up…")
         else:
-            hrv_display.metric("🧠 HRV", f"{hrv:.0f} ms")
-        risk_display.metric("⚠️ Risk Score", f"{risk}/100")
+            hrv_display.metric("HRV", f"{hrv:.0f} ms")
+        strain_display.metric("Strain Event", "YES" if is_strain else "NO")
+        risk_display.metric("Risk Score", f"{risk}/100")
         if not np.isnan(beat_quality):
-            quality_display.metric("✅ Signal Quality", f"{beat_quality:.0f}/100")
+            quality_display.metric("Signal Quality", f"{beat_quality:.0f}/100")
         else:
-            quality_display.metric("✅ Signal Quality", "—")
+            quality_display.metric("Signal Quality", "—")
         hrv_ready_display.metric("HRV Ready", "yes" if not np.isnan(hrv) else "no")
+
+        if risk < 30:
+            recommendation = "Maintain steady pace and hydration."
+        elif risk < 60:
+            recommendation = "Consider a short pause or paced breathing."
+        else:
+            recommendation = "Reduce load now and recover."
+        recommendation_display.markdown(f"**Recommendation:** {recommendation}")
 
         # Status
         if risk < 30:
@@ -170,6 +183,30 @@ if st.sidebar.button("▶️ Start Monitoring"):
             color = "red"
 
         status_indicator.markdown(f"<h2 style='color:{color};'>{status}</h2>", unsafe_allow_html=True)
+
+        # Risk gauge
+        fig_gauge = go.Figure(go.Indicator(
+            mode="gauge+number",
+            value=risk,
+            title={"text": "Strain Index"},
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"color": "red"},
+                "steps": [
+                    {"range": [0, 30], "color": "#3CB371"},
+                    {"range": [30, 60], "color": "#F0AD4E"},
+                    {"range": [60, 100], "color": "#D9534F"},
+                ],
+                "threshold": {"line": {"color": "black", "width": 4}, "thickness": 0.8, "value": 60},
+            }
+        ))
+        fig_gauge.update_layout(height=260, margin=dict(l=20, r=20, t=40, b=0))
+        st.session_state["plot_key"] += 1
+        gauge_plot.plotly_chart(
+            fig_gauge,
+            use_container_width=True,
+            key=f"gauge_plot_{st.session_state['plot_key']}"
+        )
 
         # Waveform plot
         fig_wave = go.Figure()
@@ -193,7 +230,7 @@ if st.sidebar.button("▶️ Start Monitoring"):
             ))
 
         fig_wave.update_layout(
-            title="📊 Live PPG Waveform",
+            title="Live Life Signal (PPG)",
             xaxis_title="Time (seconds)",
             yaxis_title="Filtered Signal",
             height=300
@@ -227,7 +264,7 @@ if st.sidebar.button("▶️ Start Monitoring"):
             ))
 
             fig_timeline.update_layout(
-                title="📈 Risk Timeline",
+                title="Strain Index Timeline",
                 xaxis_title="Time (seconds)",
                 yaxis_title="Risk Score",
                 height=250
