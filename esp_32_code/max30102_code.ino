@@ -4,8 +4,20 @@
 MAX30105 sensor;
 
 // ---------- CONFIG ----------
-#define SDA_PIN 21
-#define SCL_PIN 22
+// USE_PINS_21_22: 0=D18/D19, 1=D21/D22 (move wires!)
+// SWAP_SDA_SCL: 1 if scan finds nothing (try swapping SDA/SCL wires)
+#define USE_PINS_21_22 0
+#define SWAP_SDA_SCL 0
+
+#if USE_PINS_21_22
+  #define SDA_PIN 21
+  #define SCL_PIN 22
+#else
+  #define SDA_PIN 18
+  #define SCL_PIN 19
+#endif
+#define LED_GREEN 2
+#define LED_RED 4
 #define SAMPLE_DELAY 10
 #define FINGER_THRESHOLD 50000
 
@@ -46,13 +58,54 @@ long prevIR = 0;
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin(SDA_PIN, SCL_PIN);
-  
-  if (!sensor.begin(Wire, I2C_SPEED_STANDARD)) {
-    Serial.println("ERROR: MAX30102 NOT FOUND - Check wiring!");
-    while (1);
+  delay(500);
+
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(LED_GREEN, HIGH);
+    digitalWrite(LED_RED, HIGH);
+    delay(80);
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_RED, LOW);
+    delay(80);
   }
-  
+  Serial.println("PulseGuard starting...");
+
+#if SWAP_SDA_SCL
+  Wire.begin(SCL_PIN, SDA_PIN);  // Swapped
+#else
+  Wire.begin(SDA_PIN, SCL_PIN);
+#endif
+  Wire.setClock(100000);
+  delay(200);
+
+  Serial.print("I2C scan (D");
+  Serial.print(SDA_PIN);
+  Serial.print("=SDA, D");
+  Serial.print(SCL_PIN);
+  Serial.print("=SCL): ");
+  for (byte a = 1; a < 127; a++) {
+    Wire.beginTransmission(a);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("0x"); Serial.print(a, HEX); Serial.print(" ");
+    }
+  }
+  Serial.println();
+
+  if (!sensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("ERROR: MAX30102 NOT FOUND!");
+    Serial.println("TRY: 1) Swap SDA/SCL wires  2) Use D21/D22 instead");
+    Serial.println("     3) Add 4.7k pull-up: SDA->3.3V, SCL->3.3V");
+    while (1) {
+      digitalWrite(LED_RED, HIGH);
+      delay(300);
+      digitalWrite(LED_RED, LOW);
+      delay(300);
+    }
+  }
+
+  Serial.println("MAX30102 OK!");
   sensor.setup(
     0x3F,
     4,
@@ -67,7 +120,13 @@ void setup() {
   
   Serial.println("\n🫀 MAX30102 Heart Rate & SpO2 Monitor");
   Serial.println("=====================================\n");
-  
+
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_GREEN, HIGH);
+    delay(100);
+    digitalWrite(LED_GREEN, LOW);
+    delay(100);
+  }
   delay(2000);
 }
 
@@ -328,6 +387,9 @@ void loop() {
     Serial.print(millis() / 1000.0, 1);
     Serial.print("s] ");
     
+    digitalWrite(LED_GREEN, fingerDetected ? HIGH : LOW);
+    digitalWrite(LED_RED, fingerDetected ? LOW : HIGH);
+
     if (!fingerDetected) {
       Serial.println("👆 No finger detected - Place finger on sensor");
     } else {
