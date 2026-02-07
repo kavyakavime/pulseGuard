@@ -23,7 +23,7 @@ try:
         
         if line and not line.startswith("ERROR"):
             try:
-                # Parse CSV: time,ir,red,bpm,hrv,spo2,ibi,fingerDetected,hrvReady,beatQuality
+                # Parse CSV: time,ir,red,bpm,hrv,spo2,fingerDetected,hrvReady,beatQuality
                 parts = line.split(",")
                 
                 if len(parts) >= 9:
@@ -32,12 +32,13 @@ try:
                     red = int(parts[2])
                     bpm = float(parts[3])
                     hrv = float(parts[4])
-                    spo2 = float(parts[5])
-                    # New format has ibi; old format doesn't
-                    if len(parts) == 10:
-                        ibi, finger_detected, hrv_ready, beat_quality = float(parts[6]), int(parts[7]), int(parts[8]), float(parts[9])
-                    else:
-                        ibi, finger_detected, hrv_ready, beat_quality = 0, int(parts[6]), int(parts[7]), float(parts[8])
+                    spo2_raw = float(parts[5])
+                    finger_detected = int(parts[6])
+                    hrv_ready = int(parts[7])
+                    beat_quality = float(parts[8])
+                    
+                    # Calibrate SpO2: add 12, clamp between 90-100
+                    spo2 = min(max(spo2_raw + 12, 90), 100) if spo2_raw > 0 else 0
                     
                     # Clear screen for live update (optional - comment out if you want scrolling)
                     # os.system('clear' if os.name == 'posix' else 'cls')
@@ -48,8 +49,6 @@ try:
                     if finger_detected:
                         print(f"💓 BPM: {bpm:5.1f} | ", end="")
                         print(f"🫁 SpO2: {spo2:5.1f}% | ", end="")
-                        if ibi > 0:
-                            print(f"⏱️ IBI: {ibi:.0f}ms | ", end="")
                         
                         if hrv_ready:
                             print(f"📊 HRV: {hrv:5.1f}ms | ", end="")
