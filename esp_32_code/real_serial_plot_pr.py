@@ -137,12 +137,15 @@ try:
                 hrv_buf.append(arduino_hrv_last)
                 ibi_buf.append(arduino_ibi_last)
 
-                # 10-part: also has bpm,hrv,spo2,ibi - update Arduino vitals
-                if len(parts) >= 10:
+                # 9-part: time,ir,red,bpm,hrv,spo2,fingerDetected,hrvReady,beatQuality
+                if len(parts) >= 9:
                     arduino_bpm_last = float(parts[3])
                     arduino_hrv_last = float(parts[4])
-                    arduino_spo2_last = float(parts[5])
-                    arduino_ibi_last = float(parts[6])
+                    spo2_raw = float(parts[5])
+                    # Add 85 to SpO2 for display (Arduino sends raw value)
+                    arduino_spo2_last = min(spo2_raw + 85, 100) if spo2_raw > 0 else 0
+                    # IBI can be calculated from HRV or BPM if needed
+                    arduino_ibi_last = (60000.0 / arduino_bpm_last) if arduino_bpm_last > 0 else 0
                     spo2_buf.append(arduino_spo2_last)
 
             except (ValueError, IndexError):
@@ -169,18 +172,25 @@ try:
                     peaks = np.array([])
                     sig = ir_arr[-N:].astype(float)
                     dc_removed = remove_dc(sig, method="ema")
-                    filtered = scipy_signal.medfilt(dc_removed, kernel_size=5)
+                    filtered = scipy_signal.medfilt(dc_removed, kernel_size=3)  # 3 = less smoothing, preserves peaks
 
-                    # Normalize for stable thresholds
+                    # Normalize: DC remove, scale to ~±1
                     f = filtered - np.mean(filtered)
                     std = np.std(f)
-                    if std < 1e-3:
+                    if std < 1e-6:
                         peaks = np.array([])
                     else:
                         f = f / std
-                        peaks, _ = scipy_signal.find_peaks(
-                            f, distance=int(0.45 * FS_PPG), height=0.2,
-                        )
+                        dist = max(1, int(0.4 * FS_PPG))  # 400ms = 150 BPM max
+                        # PPG: systolic = peak or valley. Try both, use whichever finds beats.
+                        p_pos, _ = scipy_signal.find_peaks(f, distance=dist, height=0.05)
+                        p_neg, _ = scipy_signal.find_peaks(-f, distance=dist, height=0.05)
+                        peaks = p_pos if len(p_pos) >= len(p_neg) else p_neg
+                        # Fallback: relax height if nothing found
+                        if len(peaks) < 2 and np.ptp(f) > 0.5:
+                            p_pos, _ = scipy_signal.find_peaks(f, distance=dist, height=0.02)
+                            p_neg, _ = scipy_signal.find_peaks(-f, distance=dist, height=0.02)
+                            peaks = p_pos if len(p_pos) >= len(p_neg) else p_neg
                         peaks = peaks + (len(ir_arr) - N)  # Map back to full buffer
 
                     line_filt.set_data(t[-N:], filtered)
