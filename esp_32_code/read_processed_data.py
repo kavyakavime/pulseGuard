@@ -1,11 +1,10 @@
 """
-PulseGuard - Live PPG Monitor with Signal Processing
-====================================================
-Uses the full signal processing pipeline:
-1. DC removal
-2. Band-pass filter (0.5-5 Hz)
-3. Peak detection
-4. HR, HRV (RMSSD, SDNN) from inter-beat intervals
+PulseGuard - Live Monitor
+=========================
+Raw PPG from 3-part stream (100 Hz) for beat detection.
+HR/HRV/IBI from 10-part stream (Arduino vitals).
+Pipeline: Raw -> DC removal -> Median filter -> Normalize -> Peak detection -> Beats
+(Last 6 sec only, demo-proof)
 """
 
 import serial
@@ -16,271 +15,242 @@ import matplotlib
 matplotlib.use('TkAgg')
 import numpy as np
 from collections import deque
+from scipy import signal as scipy_signal
 
-from ppg_processor import (
-    process_ppg_pipeline,
-    remove_dc,
-    bandpass_filter,
-    detect_peaks,
-)
+from ppg_processor import remove_dc
+from ppg_features import StrainMonitor
 
+# 3-part (time,ir,red) at 100 Hz for beat detection. 10-part at 10 Hz for vitals.
+FS_PPG = 100.0   # Sampling rate for raw PPG (beat detection)
+FS_VITALS = 10.0 # Arduino vitals update rate
+
+PORT = "/dev/cu.usbserial-0001"
 BAUD = 115200
-FS_RAW = 100.0   # Sample rate when getting raw (3-part) lines
-FS_CSV = 10.0    # Sample rate when getting CSV (10-part) lines only
-WINDOW_SEC = 10
-MIN_SAMPLES_RAW = int(2 * FS_RAW)   # 200 for 100 Hz
-MIN_SAMPLES_CSV = int(2 * FS_CSV)   # 20 for 10 Hz
 
-# Buffers for raw IR (max 1000 samples)
-time_buffer = deque(maxlen=1000)
-ir_buffer = deque(maxlen=1000)
+t_buf = deque(maxlen=1200)   # 12 sec at 100 Hz
+ir_buf = deque(maxlen=1200)
+bpm_buf = deque(maxlen=1200)
+hrv_buf = deque(maxlen=1200)
+ibi_buf = deque(maxlen=1200)
+spo2_buf = deque(maxlen=1200)
 
-# Processed results
-hr_history = deque(maxlen=300)
-hrv_rmssd_history = deque(maxlen=300)
-hrv_sdnn_history = deque(maxlen=300)
-ibi_history = deque(maxlen=300)
-result_time = deque(maxlen=300)
+arduino_bpm_last = 0
+arduino_hrv_last = 0
+arduino_ibi_last = 0
+arduino_spo2_last = 0
 
-# Hold last good values when signal is bad
-last_hr = 0.0
-last_hrv = 0.0
-last_ibi = 0.0
+strain_monitor = StrainMonitor(window_sec=60, baseline_sec=30)
+strain_history = deque(maxlen=600)
+feature_time = deque(maxlen=600)
 
-def find_serial_port():
-    """Find Arduino/serial port - prefer usbserial, fallback to first available."""
+def find_port():
     ports = list(serial.tools.list_ports.comports())
-    usb = [p.device for p in ports if "usbserial" in p.device.lower() or "usbmodem" in p.device.lower()]
-    if usb:
-        return usb[0]
-    if ports:
-        return ports[0].device
-    return "/dev/cu.usbserial-0001"
+    for p in ports:
+        if "usbserial" in p.device.lower() or "usbmodem" in p.device.lower():
+            return p.device
+    return ports[0].device if ports else PORT
 
-print("PulseGuard - Signal Processing Monitor")
-print("=" * 50)
-print("Pipeline: DC removal -> Band-pass 0.5-5 Hz -> Peak detection -> HR/HRV")
-
-PORT = find_serial_port()
-print(f"Connecting to {PORT}...")
+print("PulseGuard - Live Monitor")
+print("=" * 40)
 
 try:
-    ser = serial.Serial(PORT, BAUD, timeout=0.01)
-except serial.SerialException as e:
-    print(f"\nSerial error: {e}")
-    print("Available ports:", [p.device for p in serial.tools.list_ports.comports()])
+    p = find_port()
+    ser = serial.Serial(p, BAUD, timeout=0.02)
+except Exception as e:
+    print(f"Serial error: {e}")
+    print("Try: ls /dev/cu.*")
     exit(1)
 
 time.sleep(2)
+ser.reset_input_buffer()
 
-# Flush startup junk
-for _ in range(20):
-    ser.readline()
-
-print("Connected. Reading data...\n")
-
-# Setup plots
 plt.ion()
-fig = plt.figure(figsize=(14, 10))
-gs = fig.add_gridspec(4, 2, hspace=0.3, wspace=0.3)
+fig, axes = plt.subplots(6, 1, figsize=(12, 11), sharex=True)
+ax_raw, ax_filt, ax_hr, ax_hrv, ax_ibi, ax_strain = axes
 
-# Raw PPG
-ax_raw = fig.add_subplot(gs[0, :])
-line_raw, = ax_raw.plot([], [], 'r-', label='IR (raw)', linewidth=1, alpha=0.8)
-ax_raw.set_title('Raw PPG Signal', fontsize=12, fontweight='bold')
-ax_raw.set_ylabel('ADC Value')
-ax_raw.legend(loc='upper right')
+line_raw, = ax_raw.plot([], [], 'r-', lw=1)
+ax_raw.set_ylabel("AC (DC-removed)")
+ax_raw.set_title("Raw PPG (DC-removed)")
 ax_raw.grid(True, alpha=0.3)
 
-# Filtered PPG with peaks
-ax_filt = fig.add_subplot(gs[1, :])
-line_filt, = ax_filt.plot([], [], 'b-', label='Filtered', linewidth=1)
-line_peaks, = ax_filt.plot([], [], 'ro', markersize=4, label='Beats')
-ax_filt.set_title('Filtered PPG (0.5-5 Hz) + Detected Beats', fontweight='bold')
-ax_filt.set_ylabel('Amplitude')
+line_filt, = ax_filt.plot([], [], 'b-', lw=1, label='Filtered')
+line_beats, = ax_filt.plot([], [], 'ro', markersize=8, label='Beats')
+ax_filt.set_ylabel("Amplitude")
+ax_filt.set_title("Filtered PPG (median) + Detected Beats")
 ax_filt.legend(loc='upper right')
 ax_filt.grid(True, alpha=0.3)
 
-# HR
-ax_hr = fig.add_subplot(gs[2, 0])
-line_hr, = ax_hr.plot([], [], 'crimson', linewidth=2)
-ax_hr.set_title('Heart Rate (from peaks)', fontweight='bold')
-ax_hr.set_ylabel('BPM')
+line_hr, = ax_hr.plot([], [], 'crimson', lw=2)
+ax_hr.set_ylabel("BPM")
+ax_hr.set_title("Heart Rate")
 ax_hr.set_ylim(40, 120)
 ax_hr.grid(True, alpha=0.3)
-ax_hr.axhspan(60, 100, alpha=0.1, color='green')
 
-# HRV
-ax_hrv = fig.add_subplot(gs[2, 1])
-line_rmssd, = ax_hrv.plot([], [], 'purple', linewidth=2, label='RMSSD')
-line_sdnn, = ax_hrv.plot([], [], 'green', linewidth=2, label='SDNN')
-ax_hrv.set_title('HRV (RMSSD / SDNN)', fontweight='bold')
-ax_hrv.set_ylabel('ms')
-ax_hrv.legend(loc='upper right')
+line_hrv, = ax_hrv.plot([], [], 'purple', lw=2)
+ax_hrv.set_ylabel("ms")
+ax_hrv.set_title("HRV (RMSSD)")
 ax_hrv.set_ylim(0, 200)
 ax_hrv.grid(True, alpha=0.3)
 
-# IBI
-ax_ibi = fig.add_subplot(gs[3, :])
-line_ibi, = ax_ibi.plot([], [], 'orange', linewidth=2, marker='o', markersize=3)
-ax_ibi.set_title('Inter-Beat Interval', fontweight='bold')
-ax_ibi.set_xlabel('Time (seconds)')
-ax_ibi.set_ylabel('IBI (ms)')
-ax_ibi.set_ylim(300, 1500)
+line_ibi, = ax_ibi.plot([], [], 'orange', lw=2)
+ax_ibi.set_ylabel("ms")
+ax_ibi.set_title("Inter-Beat Interval")
+ax_ibi.set_ylim(400, 1500)
 ax_ibi.grid(True, alpha=0.3)
 
+line_strain, = ax_strain.plot([], [], 'red', lw=3)
+ax_strain.set_ylabel("Strain (0-1)")
+ax_strain.set_xlabel("Time (s)")
+ax_strain.set_title("Strain Index")
+ax_strain.set_ylim(0, 1)
+ax_strain.axhspan(0.0, 0.3, alpha=0.1, color='green')
+ax_strain.axhspan(0.3, 0.6, alpha=0.1, color='yellow')
+ax_strain.axhspan(0.6, 1.0, alpha=0.1, color='red')
+ax_strain.grid(True, alpha=0.3)
+
+plt.tight_layout()
 fig.canvas.draw()
 
-print("Window opened. Monitoring...\n")
+print("Connected. Place finger on sensor (100 Hz PPG for beat detection).\n")
 
 try:
-    last_process_time = 0
-    samples_per_sec = 0
-    last_sample_count = 0
-    last_rate_time = time.time()
-    
     while True:
-        # Read serial - accept BOTH 3-part (raw) and 10-part (CSV) - use first 3 values
+        # Read ALL available lines - need 3-part for 100 Hz PPG
         for _ in range(200):
             try:
                 line = ser.readline().decode("utf-8", errors="ignore").strip()
-                if not line or line.startswith("ERROR") or line.startswith("["):
+                if not line or line.startswith("ERROR"):
+                    continue
+                if line.startswith("["):  # Skip human-readable
                     continue
                 parts = line.split(",")
                 if len(parts) < 3:
                     continue
-                timestamp = int(parts[0])
+
+                ts = int(parts[0]) / 1000.0
                 ir = int(parts[1])
-                red = int(parts[2])
-                
-                time_buffer.append(timestamp / 1000.0)
-                ir_buffer.append(ir)
+
+                # 3-part: time,ir,red - add to PPG buffers (100 Hz)
+                t_buf.append(ts)
+                ir_buf.append(ir)
+                bpm_buf.append(arduino_bpm_last)
+                hrv_buf.append(arduino_hrv_last)
+                ibi_buf.append(arduino_ibi_last)
+
+                # 9-part: time,ir,red,bpm,hrv,spo2,fingerDetected,hrvReady,beatQuality
+                if len(parts) >= 9:
+                    arduino_bpm_last = float(parts[3])
+                    arduino_hrv_last = float(parts[4])
+                    spo2_raw = float(parts[5])
+                    # Add 85 to SpO2 for display (Arduino sends raw value)
+                    arduino_spo2_last = min(spo2_raw + 85, 100) if spo2_raw > 0 else 0
+                    # IBI can be calculated from HRV or BPM if needed
+                    arduino_ibi_last = (60000.0 / arduino_bpm_last) if arduino_bpm_last > 0 else 0
+                    spo2_buf.append(arduino_spo2_last)
+
             except (ValueError, IndexError):
                 continue
-        
-        # Infer sample rate from data
-        n = len(ir_buffer)
-        if n >= 2:
-            t_span = time_buffer[-1] - time_buffer[0]
-            if t_span > 0.1:
-                FS = (n - 1) / t_span
+
+        # Update plots
+        if len(t_buf) > 2:
+            t = np.array(t_buf)
+            ir_arr = np.array(list(ir_buf)).astype(float)
+            ir_arr = ir_arr - np.mean(ir_arr)  # Quick DC removal for display
+
+            line_raw.set_data(t, ir_arr)
+            ax_raw.set_xlim(t[0], t[-1])
+            if np.ptp(ir_arr) > 10:
+                margin = np.ptp(ir_arr) * 0.15
+                ax_raw.set_ylim(np.min(ir_arr) - margin, np.max(ir_arr) + margin)
             else:
-                FS = FS_RAW if n > 50 else FS_CSV
-        else:
-            FS = FS_CSV
-        MIN_SAMPLES = int(2 * FS)
-        
-        # Always update raw PPG when we have data
-        if len(ir_buffer) > 1:
-            t_arr = np.array(list(time_buffer))
-            ir_arr = np.array(list(ir_buffer))
-            line_raw.set_data(t_arr, ir_arr)
-            ax_raw.set_xlim(t_arr[0], t_arr[-1])
-            if len(ir_arr) > 0:
-                r = np.ptp(ir_arr) or 1000
-                y_min = np.min(ir_arr) - 0.05 * r
-                y_max = np.max(ir_arr) + 0.05 * r
-                ax_raw.set_ylim(y_min, y_max)
-        
-        # Run full processing every 500ms when we have enough samples
-        now = time.time()
-        if now - last_process_time >= 0.5 and len(ir_buffer) >= MIN_SAMPLES:
-            last_process_time = now
-            
-            t = np.array(list(time_buffer))
-            ir = np.array(list(ir_buffer))
-            
-            result = process_ppg_pipeline(ir, fs=FS)
-            
-            # Use result if good (40-120 BPM, quality>=30); else hold last good
-            hr_val = result["hr"]
-            quality = result.get("quality", 0)
-            if hr_val >= 40 and hr_val <= 120 and quality >= 30:
-                last_hr = hr_val
-                last_hrv = result["hrv_rmssd"]
-                last_ibi = np.median(result["ibi_ms"]) if len(result["ibi_ms"]) > 0 else last_ibi
-            elif last_hr > 0:
-                hr_val = last_hr
-                result = {**result, "hr": last_hr, "hrv_rmssd": last_hrv}
-            
-            if hr_val > 0:
-                hr_history.append(hr_val)
-                hrv_rmssd_history.append(result["hrv_rmssd"])
-                hrv_sdnn_history.append(result["hrv_sdnn"])
-                result_time.append(t[-1])
-                ibi_mean = np.median(result["ibi_ms"]) if len(result["ibi_ms"]) > 0 else last_ibi
-                if ibi_mean > 0:
-                    last_ibi = ibi_mean
-                ibi_history.append(ibi_mean if ibi_mean > 0 else last_ibi)
-            
-            # Update plots (raw PPG already updated above)
-            t_arr = np.array(t)
-            
-            # Filtered + peaks
-            filt = result["filtered_signal"]
-            peaks = result["peaks"]
-            if len(filt) > 0:
-                line_filt.set_data(t_arr[:len(filt)], filt)
-                if len(peaks) > 0:
-                    line_peaks.set_data(t_arr[peaks], filt[peaks])
-                else:
-                    line_peaks.set_data([], [])
-                ax_filt.set_xlim(t_arr[0], t_arr[-1])
-                if len(filt) > 0:
-                    r = np.ptp(filt)
-                    ax_filt.set_ylim(np.min(filt) - 0.1 * r, np.max(filt) + 0.1 * r)
-            
-            # HR
-            if len(hr_history) > 0:
-                tr = list(result_time)
-                line_hr.set_data(tr, list(hr_history))
-                ax_hr.set_xlim(tr[0], tr[-1])
-            
-            # HRV
-            if len(hrv_rmssd_history) > 0:
-                tr = list(result_time)
-                line_rmssd.set_data(tr, list(hrv_rmssd_history))
-                line_sdnn.set_data(tr, list(hrv_sdnn_history))
-                ax_hrv.set_xlim(tr[0], tr[-1])
-            
-            # IBI
-            if len(ibi_history) > 0:
-                tr = list(result_time)
-                line_ibi.set_data(tr, list(ibi_history))
-                ax_ibi.set_xlim(tr[0], tr[-1])
-            
-            # Terminal output
-            n_buf = len(ir_buffer)
-            q = result.get("quality", 0)
-            if result["hr"] > 0:
-                hold = " (holding)" if q < 30 else ""
-                print(f"\r[{t_arr[-1]:.1f}s] HR: {result['hr']:.1f} BPM | "
-                      f"HRV: {result['hrv_rmssd']:.1f} ms | "
-                      f"IBI: {last_ibi:.0f} ms | "
-                      f"Q:{q:.0f}{hold}", end="", flush=True)
-            else:
-                print(f"\r[{t_arr[-1]:.1f}s] No beats | "
-                      f"Buffer: {n_buf} | "
-                      f"Hold finger steady on sensor", end="", flush=True)
-        elif len(ir_buffer) > 0:
-            print(f"\rBuffer: {len(ir_buffer)} samples (need {MIN_SAMPLES})...", end="", flush=True)
-        
+                ax_raw.set_ylim(-500, 500)
+
+            num_beats = 0
+            N = int(6 * FS_PPG)  # Last 6 seconds only
+            if len(ir_arr) >= N:
+                try:
+                    peaks = np.array([])
+                    sig = ir_arr[-N:].astype(float)
+                    dc_removed = remove_dc(sig, method="ema")
+                    filtered = scipy_signal.medfilt(dc_removed, kernel_size=3)  # 3 = less smoothing, preserves peaks
+
+                    # Normalize: DC remove, scale to ~±1
+                    f = filtered - np.mean(filtered)
+                    std = np.std(f)
+                    if std < 1e-6:
+                        peaks = np.array([])
+                    else:
+                        f = f / std
+                        dist = max(1, int(0.4 * FS_PPG))  # 400ms = 150 BPM max
+                        # PPG: systolic = peak or valley. Try both, use whichever finds beats.
+                        p_pos, _ = scipy_signal.find_peaks(f, distance=dist, height=0.05)
+                        p_neg, _ = scipy_signal.find_peaks(-f, distance=dist, height=0.05)
+                        peaks = p_pos if len(p_pos) >= len(p_neg) else p_neg
+                        # Fallback: relax height if nothing found
+                        if len(peaks) < 2 and np.ptp(f) > 0.5:
+                            p_pos, _ = scipy_signal.find_peaks(f, distance=dist, height=0.02)
+                            p_neg, _ = scipy_signal.find_peaks(-f, distance=dist, height=0.02)
+                            peaks = p_pos if len(p_pos) >= len(p_neg) else p_neg
+                        peaks = peaks + (len(ir_arr) - N)  # Map back to full buffer
+
+                    line_filt.set_data(t[-N:], filtered)
+                    if len(peaks) > 0:
+                        offset = len(ir_arr) - N
+                        valid_idx = peaks[(peaks < len(t)) & (peaks >= offset) & (peaks < len(ir_arr))]
+                        if len(valid_idx) > 0:
+                            peak_in_seg = valid_idx - offset
+                            num_beats = len(valid_idx)
+                            line_beats.set_data(t[valid_idx], filtered[peak_in_seg])
+                        else:
+                            line_beats.set_data([], [])
+                    else:
+                        line_beats.set_data([], [])
+
+                    ax_filt.set_xlim(t[-N], t[-1])
+                    if np.ptp(filtered) > 1:
+                        margin = np.ptp(filtered) * 0.2
+                        ax_filt.set_ylim(np.min(filtered) - margin, np.max(filtered) + margin)
+                    else:
+                        ax_filt.set_ylim(-500, 500)
+
+                except Exception:
+                    line_filt.set_data(t, np.zeros_like(t))
+                    line_beats.set_data([], [])
+
+            line_hr.set_data(t, list(bpm_buf))
+            line_hrv.set_data(t, list(hrv_buf))
+            line_ibi.set_data(t, list(ibi_buf))
+            ax_hr.set_xlim(t[0], t[-1])
+            ax_hrv.set_xlim(t[0], t[-1])
+            ax_ibi.set_xlim(t[0], t[-1])
+
+            display_hr = arduino_bpm_last if arduino_bpm_last > 0 else (bpm_buf[-1] if bpm_buf else 0)
+            display_hrv = arduino_hrv_last
+            display_ibi = arduino_ibi_last
+            if display_hr > 0:
+                strain_monitor.add_sample(t[-1], display_hr, display_hrv, display_ibi)
+
+            features = strain_monitor.get_features()
+            strain_history.append(features["strain_index"])
+            feature_time.append(t[-1])
+            if len(strain_history) > 1:
+                ft = np.array(feature_time)
+                line_strain.set_data(ft, list(strain_history))
+                ax_strain.set_xlim(ft[0], ft[-1])
+
+            status = "STRAINED" if features["strain_index"] > 0.6 else ("MODERATE" if features["strain_index"] > 0.3 else "RELAXED")
+            base = strain_monitor.get_baseline_str()
+            print(f"\r[{t[-1]:.0f}s] HR: {display_hr:.1f} | HRV: {display_hrv:.1f}ms | IBI: {display_ibi:.0f}ms | "
+                  f"Beats: {num_beats} | Strain: {features['strain_index']:.2f} ({status})", end="", flush=True)
+
         fig.canvas.draw()
         fig.canvas.flush_events()
-        plt.pause(0.05)
+        plt.pause(0.02)
 
 except KeyboardInterrupt:
-    print("\n\nMonitoring stopped")
-except Exception as e:
-    print(f"\nError: {e}")
+    print("\n\nStopped.")
 finally:
-    try:
-        ser.close()
-    except Exception:
-        pass
-    try:
-        plt.ioff()
-        plt.close()
-    except Exception:
-        pass
-    print("Serial connection closed.")
+    ser.close()
+    plt.ioff()
+    plt.close()
+    print("Done.")
