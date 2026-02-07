@@ -1,0 +1,8 @@
+pyserial
+numpy
+pandas
+matplotlib
+python-dotenv
+streamlit
+requests
+opencv-python
