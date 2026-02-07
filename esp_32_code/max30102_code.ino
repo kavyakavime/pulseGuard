@@ -1,11 +1,12 @@
 /* PulseGuard - MAX30102 Heart Rate & SpO2 Monitor
- * Uses bandpass filtering + peak detection + ratio-of-ratios SpO2
+ * Uses Maxim algorithm with proper buffering and smoothing
  * CSV: time,ir,red,bpm,hrv,spo2,fingerDetected,hrvReady,beatQuality
  * LEDs: Green=finger on, Red=finger off
  */
 
 #include <Wire.h>
 #include "MAX30105.h"
+#include "spo2_algorithm.h"
 
 MAX30105 particleSensor;
 
@@ -16,26 +17,25 @@ MAX30105 particleSensor;
 #define LED_RED 4
 
 #define BUFFER_LEN 100
-#define REPORTING_PERIOD_MS 1000
 #define FINGER_THRESHOLD 50000
 
-// Bandpass filter arrays (5-point)
-float firxv[5] = {0};  // IR input filter values
-float firyv[5] = {0};  // IR output filter values
-float fredxv[5] = {0}; // Red input filter values
-float fredyv[5] = {0}; // Red output filter values
+// Maxim algorithm buffers
+uint32_t irBuffer[BUFFER_LEN];
+uint32_t redBuffer[BUFFER_LEN];
 
-// Heart rate and SpO2 averaging
-float hrArray[5] = {0};
-float spo2Array[5] = {0};
-int arrayIdx = 0;
+// Maxim algorithm outputs
+int32_t spo2;
+int8_t validSPO2;
+int32_t heartRate;
+int8_t validHeartRate;
 
-float heartRate = 0.0;
-float spo2 = 0.0;
-float lastMeasTime = 0.0;
-unsigned long tcnt = 0;
+// Smoothed averages (exponential moving average)
+float smoothedHR = 0;
+float smoothedSpO2 = 0;
+const float ALPHA = 0.2; // Smoothing factor (lower = smoother)
 
 // HRV calculation
+unsigned long lastBeatTime = 0;
 float lastIBI = 0;
 #define HRV_BUF 20
 float ibiHistory[HRV_BUF];
@@ -44,6 +44,9 @@ bool hrvReady = false;
 
 float signalQuality = 0;
 bool fingerDetected = false;
+
+// Tracking
+int validReadings = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -101,6 +104,9 @@ float computeHRV() {
 }
 
 void loop() {
+  // Continuously fill buffer with new samples
+  static int bufferIndex = 0;
+  
   // Wait for sensor data
   while (!particleSensor.available())
     particleSensor.check();
@@ -109,6 +115,11 @@ void loop() {
   uint32_t redValue = particleSensor.getRed();
   uint32_t irValue = particleSensor.getIR();
   particleSensor.nextSample();
+  
+  // Store in circular buffer
+  irBuffer[bufferIndex] = irValue;
+  redBuffer[bufferIndex] = redValue;
+  bufferIndex = (bufferIndex + 1) % BUFFER_LEN;
   
   // Finger detection
   fingerDetected = (irValue > FINGER_THRESHOLD);
@@ -120,96 +131,64 @@ void loop() {
     signalQuality = constrain((float)irValue / 3000.0f, 0, 100);
   } else {
     signalQuality = 0;
+    smoothedHR = 0;
+    smoothedSpO2 = 0;
+    validReadings = 0;
   }
   
-  // Update measurement time (100 Hz sample rate = 10ms per sample)
-  float measTime = 0.01 * tcnt++;
+  // Run Maxim algorithm every 25 samples (4x per second at 100Hz)
+  static int sampleCount = 0;
+  sampleCount++;
   
-  // Apply bandpass filter to IR signal
-  firxv[0] = firxv[1];
-  firxv[1] = firxv[2];
-  firxv[2] = firxv[3];
-  firxv[3] = firxv[4];
-  firxv[4] = irValue / 3.48311;
-  
-  firyv[0] = firyv[1];
-  firyv[1] = firyv[2];
-  firyv[2] = firyv[3];
-  firyv[3] = firyv[4];
-  firyv[4] = (firxv[0] + firxv[4]) - 2 * firxv[2]
-             + (-0.1718123813 * firyv[0]) + (0.3686645260 * firyv[1])
-             + (-1.1718123813 * firyv[2]) + (1.9738037992 * firyv[3]);
-  
-  // Apply bandpass filter to Red signal
-  fredxv[0] = fredxv[1];
-  fredxv[1] = fredxv[2];
-  fredxv[2] = fredxv[3];
-  fredxv[3] = fredxv[4];
-  fredxv[4] = redValue / 3.48311;
-  
-  fredyv[0] = fredyv[1];
-  fredyv[1] = fredyv[2];
-  fredyv[2] = fredyv[3];
-  fredyv[3] = fredyv[4];
-  fredyv[4] = (fredxv[0] + fredxv[4]) - 2 * fredxv[2]
-              + (-0.1718123813 * fredyv[0]) + (0.3686645260 * fredyv[1])
-              + (-1.1718123813 * fredyv[2]) + (1.9738037992 * fredyv[3]);
-  
-  // Peak detection: check if current point is a local maximum
-  if (-1.0 * firyv[4] >= 100 && 
-      -1.0 * firyv[2] > -1.0 * firyv[0] && 
-      -1.0 * firyv[2] > -1.0 * firyv[4]) {
+  if (sampleCount >= 25) {
+    sampleCount = 0;
     
-    float timeDelta = measTime - lastMeasTime;
+    // Run Maxim algorithm on full buffer
+    maxim_heart_rate_and_oxygen_saturation(
+      irBuffer, BUFFER_LEN, redBuffer,
+      &spo2, &validSPO2, &heartRate, &validHeartRate
+    );
     
-    // Reject peaks that are too close (< 0.5s = 120+ BPM max)
-    if (timeDelta >= 0.5) {
-      // Calculate instantaneous heart rate
-      float instantHR = 60.0 / timeDelta;
-      
-      // Calculate instantaneous SpO2 using ratio-of-ratios
-      float ratioRed = fredyv[4] / fredxv[4];
-      float ratioIR = firyv[4] / firxv[4];
-      float instantSpO2 = 110.0 - 25.0 * (ratioRed / ratioIR);
-      if (instantSpO2 > 100.0) instantSpO2 = 99.9;
-      
-      // Store in arrays for averaging
-      hrArray[arrayIdx % 5] = instantHR;
-      spo2Array[arrayIdx % 5] = instantSpO2;
-      arrayIdx++;
-      
-      // Store IBI for HRV
-      lastIBI = timeDelta * 1000.0; // Convert to ms
-      if (ibiIdx < 1000) {
-        ibiHistory[ibiIdx % HRV_BUF] = lastIBI;
-        ibiIdx++;
+    // Apply smoothing if readings are valid
+    if (fingerDetected) {
+      if (validHeartRate == 1 && heartRate > 40 && heartRate < 150) {
+        if (smoothedHR == 0) {
+          smoothedHR = heartRate; // Initialize
+        } else {
+          smoothedHR = ALPHA * heartRate + (1 - ALPHA) * smoothedHR; // EMA
+        }
+        validReadings++;
+        
+        // HRV calculation (store IBI on valid beat)
+        if (lastBeatTime > 0) {
+          lastIBI = millis() - lastBeatTime;
+          if (lastIBI > 300 && lastIBI < 2000 && ibiIdx < 1000) { // Valid IBI range
+            ibiHistory[ibiIdx % HRV_BUF] = lastIBI;
+            ibiIdx++;
+          }
+        }
+        lastBeatTime = millis();
       }
       
-      // Calculate averaged values
-      heartRate = (hrArray[0] + hrArray[1] + hrArray[2] + hrArray[3] + hrArray[4]) / 5.0;
-      spo2 = (spo2Array[0] + spo2Array[1] + spo2Array[2] + spo2Array[3] + spo2Array[4]) / 5.0;
-      
-      // Validate ranges
-      if (heartRate < 40 || heartRate > 150) heartRate = 0;
-      if (spo2 < 50 || spo2 > 101) spo2 = 0;
-      
-      lastMeasTime = measTime;
+      if (validSPO2 == 1 && spo2 > 50 && spo2 < 101) {
+        if (smoothedSpO2 == 0) {
+          smoothedSpO2 = spo2; // Initialize
+        } else {
+          smoothedSpO2 = ALPHA * spo2 + (1 - ALPHA) * smoothedSpO2; // EMA
+        }
+      }
     }
-  }
-  
-  // Reset if no beat detected for 1.8 seconds
-  if (heartRate > 0 && (measTime - lastMeasTime) > 1.8) {
-    fingerDetected = false;
   }
   
   // Calculate HRV
   hrvReady = (ibiIdx >= 5);
   float hrv = computeHRV();
   
-  // Output CSV
-  int displayBPM = fingerDetected ? (int)heartRate : 0;
-  int displaySpO2 = fingerDetected ? (int)spo2 : 0;
+  // Prepare output (only show stable readings after 3+ valid measurements)
+  int displayBPM = (fingerDetected && validReadings >= 3) ? (int)smoothedHR : 0;
+  int displaySpO2 = (fingerDetected && validReadings >= 3) ? (int)smoothedSpO2 : 0;
   
+  // CSV Output
   Serial.print(millis());
   Serial.print(",");
   Serial.print(irValue);
