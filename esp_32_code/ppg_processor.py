@@ -289,3 +289,4 @@ def process_ppg_pipeline(
         "filtered_signal": filt_padded,
         "quality": quality,
     }
+
